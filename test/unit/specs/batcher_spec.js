@@ -1,18 +1,15 @@
-var _ = require('../../../src/util')
-var batcher = require('../../../src/batcher')
-var nextTick = require('../../../src/util').nextTick
+var config = require('src/config')
+var batcher = require('src/batcher')
+var nextTick = require('src/util').nextTick
 
 describe('Batcher', function () {
-
   var spy
-
   beforeEach(function () {
     spy = jasmine.createSpy('batcher')
-    spyOn(_, 'warn')
   })
-  
-  it('push', function (done) {
-    batcher.push({
+
+  it('pushWatcher', function (done) {
+    batcher.pushWatcher({
       run: spy
     })
     nextTick(function () {
@@ -22,11 +19,11 @@ describe('Batcher', function () {
   })
 
   it('dedup', function (done) {
-    batcher.push({
+    batcher.pushWatcher({
       id: 1,
       run: spy
     })
-    batcher.push({
+    batcher.pushWatcher({
       id: 1,
       run: spy
     })
@@ -37,14 +34,15 @@ describe('Batcher', function () {
   })
 
   it('allow diplicate when flushing', function (done) {
-    batcher.push({
+    var job = {
       id: 1,
+      run: spy
+    }
+    batcher.pushWatcher(job)
+    batcher.pushWatcher({
+      id: 2,
       run: function () {
-        spy()
-        batcher.push({
-          id: 1,
-          run: spy
-        })
+        batcher.pushWatcher(job)
       }
     })
     nextTick(function () {
@@ -58,19 +56,19 @@ describe('Batcher', function () {
     function run () {
       vals.push(this.id)
     }
-    batcher.push({
+    batcher.pushWatcher({
       id: 2,
       user: true,
       run: function () {
         run.call(this)
         // user watcher triggering another directive update!
-        batcher.push({
+        batcher.pushWatcher({
           id: 3,
           run: run
         })
       }
     })
-    batcher.push({
+    batcher.pushWatcher({
       id: 1,
       run: run
     })
@@ -88,15 +86,36 @@ describe('Batcher', function () {
       id: 1,
       run: function () {
         count++
-        batcher.push(job)
+        batcher.pushWatcher(job)
       }
     }
-    batcher.push(job)
+    batcher.pushWatcher(job)
     nextTick(function () {
-      expect(count).not.toBe(0)
-      expect(_.warn).toHaveBeenCalled()
+      expect(count).toBe(config._maxUpdateCount + 1)
+      expect('infinite update loop').toHaveBeenWarned()
       done()
     })
   })
 
+  it('should call newly pushed watcher after current watcher is done', function (done) {
+    var callOrder = []
+    batcher.pushWatcher({
+      id: 1,
+      user: true,
+      run: function () {
+        callOrder.push(1)
+        batcher.pushWatcher({
+          id: 2,
+          run: function () {
+            callOrder.push(3)
+          }
+        })
+        callOrder.push(2)
+      }
+    })
+    nextTick(function () {
+      expect(callOrder.join()).toBe('1,2,3')
+      done()
+    })
+  })
 })

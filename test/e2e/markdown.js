@@ -1,7 +1,6 @@
 casper.test.begin('markdown', 5, function (test) {
-  
   casper
-  .start('../../examples/markdown/index.html')
+  .start('examples/markdown/index.html')
   .then(function () {
     test.assertEval(function () {
       return document.querySelector('textarea').value === '# hello'
@@ -14,14 +13,15 @@ casper.test.begin('markdown', 5, function (test) {
   .then(function () {
     this.sendKeys(
       'textarea',
-      '## yo\n\n' +
-      '- test\n' +
-      '- hi\n\n'
+      '## foo\n\n' +
+      '- bar\n' +
+      '- baz\n\n',
+      { keepFocus: true }
     )
     // keyUp(13)
   })
   .then(function () {
-    // assert the output is not updarted yet because of
+    // assert the output is not updated yet because of
     // debounce
     test.assertEval(function () {
       return document.querySelector('#editor div')
@@ -31,14 +31,14 @@ casper.test.begin('markdown', 5, function (test) {
   .wait(300) // wait for debounce
   .then(function () {
     test.assertEval(function () {
-      return document.querySelector('textarea').value
-        === '## yo\n\n- test\n- hi\n\n# hello'
+      return document.querySelector('textarea').value ===
+        '## foo\n\n- bar\n- baz\n\n# hello'
     })
     test.assertEval(function () {
       return document.querySelector('#editor div')
         .innerHTML ===
-          '<h2 id="yo">yo</h2>\n' +
-          '<ul>\n<li>test</li>\n<li>hi</li>\n</ul>\n' +
+          '<h2 id="foo">foo</h2>\n' +
+          '<ul>\n<li>bar</li>\n<li>baz</li>\n</ul>\n' +
           '<h1 id="hello">hello</h1>\n'
     })
   })
@@ -46,5 +46,4 @@ casper.test.begin('markdown', 5, function (test) {
   .run(function () {
     test.done()
   })
-
 })

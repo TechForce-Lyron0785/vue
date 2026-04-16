@@ -1,7 +1,6 @@
-var Dep = require('../../../../src/observer/dep')
+var Dep = require('src/observer/dep')
 
 describe('Dep', function () {
-
   var d
   beforeEach(function () {
     d = new Dep()
@@ -30,5 +29,4 @@ describe('Dep', function () {
     d.notify()
     expect(sub.update).toHaveBeenCalled()
   })
-
 })

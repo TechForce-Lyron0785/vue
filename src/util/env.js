@@ -1,21 +1,56 @@
-/**
- * Can we use __proto__?
- *
- * @type {Boolean}
- */
+/* global MutationObserver */
 
-exports.hasProto = '__proto__' in {}
+// can we use __proto__?
+export const hasProto = '__proto__' in {}
 
-/**
- * Indicates we have a window
- *
- * @type {Boolean}
- */
-
-var toString = Object.prototype.toString
-var inBrowser = exports.inBrowser =
+// Browser environment sniffing
+export const inBrowser =
   typeof window !== 'undefined' &&
-  toString.call(window) !== '[object Object]'
+  Object.prototype.toString.call(window) !== '[object Object]'
+
+// detect devtools
+export const devtools = inBrowser && window.__VUE_DEVTOOLS_GLOBAL_HOOK__
+
+// UA sniffing for working around browser-specific quirks
+const UA = inBrowser && window.navigator.userAgent.toLowerCase()
+export const isIE9 = UA && UA.indexOf('msie 9.0') > 0
+export const isAndroid = UA && UA.indexOf('android') > 0
+export const isIos = UA && /(iphone|ipad|ipod|ios)/i.test(UA)
+export const isWechat = UA && UA.indexOf('micromessenger') > 0
+
+let transitionProp
+let transitionEndEvent
+let animationProp
+let animationEndEvent
+
+// Transition property/event sniffing
+if (inBrowser && !isIE9) {
+  const isWebkitTrans =
+    window.ontransitionend === undefined &&
+    window.onwebkittransitionend !== undefined
+  const isWebkitAnim =
+    window.onanimationend === undefined &&
+    window.onwebkitanimationend !== undefined
+  transitionProp = isWebkitTrans
+    ? 'WebkitTransition'
+    : 'transition'
+  transitionEndEvent = isWebkitTrans
+    ? 'webkitTransitionEnd'
+    : 'transitionend'
+  animationProp = isWebkitAnim
+    ? 'WebkitAnimation'
+    : 'animation'
+  animationEndEvent = isWebkitAnim
+    ? 'webkitAnimationEnd'
+    : 'animationend'
+}
+
+export {
+  transitionProp,
+  transitionEndEvent,
+  animationProp,
+  animationEndEvent
+}
 
 /**
  * Defer a task to execute it asynchronously. Ideally this
@@ -27,11 +62,11 @@ var inBrowser = exports.inBrowser =
  * @param {Object} ctx
  */
 
-exports.nextTick = (function () {
+export const nextTick = (function () {
   var callbacks = []
   var pending = false
   var timerFunc
-  function handle () {
+  function nextTickHandler () {
     pending = false
     var copies = callbacks.slice(0)
     callbacks = []
@@ -39,10 +74,11 @@ exports.nextTick = (function () {
       copies[i]()
     }
   }
+
   /* istanbul ignore if */
-  if (typeof MutationObserver !== 'undefined') {
+  if (typeof MutationObserver !== 'undefined' && !(isWechat && isIos)) {
     var counter = 1
-    var observer = new MutationObserver(handle)
+    var observer = new MutationObserver(nextTickHandler)
     var textNode = document.createTextNode(counter)
     observer.observe(textNode, {
       characterData: true
@@ -52,7 +88,13 @@ exports.nextTick = (function () {
       textNode.data = counter
     }
   } else {
-    timerFunc = setTimeout
+    // webpack attempts to inject a shim for setImmediate
+    // if it is used as a global, so we have to work around that to
+    // avoid bundling unnecessary code.
+    const context = inBrowser
+      ? window
+      : typeof global !== 'undefined' ? global : {}
+    timerFunc = context.setImmediate || setTimeout
   }
   return function (cb, ctx) {
     var func = ctx
@@ -61,41 +103,29 @@ exports.nextTick = (function () {
     callbacks.push(func)
     if (pending) return
     pending = true
-    timerFunc(handle, 0)
+    timerFunc(nextTickHandler, 0)
   }
 })()
 
-/**
- * Detect if we are in IE9...
- *
- * @type {Boolean}
- */
-
-exports.isIE9 =
-  inBrowser &&
-  navigator.userAgent.indexOf('MSIE 9.0') > 0
-
-/**
- * Sniff transition/animation events
- */
-
-if (inBrowser && !exports.isIE9) {
-  var isWebkitTrans =
-    window.ontransitionend === undefined &&
-    window.onwebkittransitionend !== undefined
-  var isWebkitAnim =
-    window.onanimationend === undefined &&
-    window.onwebkitanimationend !== undefined
-  exports.transitionProp = isWebkitTrans
-    ? 'WebkitTransition'
-    : 'transition'
-  exports.transitionEndEvent = isWebkitTrans
-    ? 'webkitTransitionEnd'
-    : 'transitionend'
-  exports.animationProp = isWebkitAnim
-    ? 'WebkitAnimation'
-    : 'animation'
-  exports.animationEndEvent = isWebkitAnim
-    ? 'webkitAnimationEnd'
-    : 'animationend'
+let _Set
+/* istanbul ignore if */
+if (typeof Set !== 'undefined' && Set.toString().match(/native code/)) {
+  // use native Set when available.
+  _Set = Set
+} else {
+  // a non-standard Set polyfill that only works with primitive keys.
+  _Set = function () {
+    this.set = Object.create(null)
+  }
+  _Set.prototype.has = function (key) {
+    return this.set[key] !== undefined
+  }
+  _Set.prototype.add = function (key) {
+    this.set[key] = 1
+  }
+  _Set.prototype.clear = function () {
+    this.set = Object.create(null)
+  }
 }
+
+export { _Set }

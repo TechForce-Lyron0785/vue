@@ -1,38 +1,55 @@
-var _ = require('../util')
-var config = require('../config')
-var textParser = require('../parsers/text')
-var dirParser = require('../parsers/directive')
-var templateParser = require('../parsers/template')
+import publicDirectives from '../directives/public/index'
+import internalDirectives from '../directives/internal/index'
+import { compileProps } from './compile-props'
+import { parseText, tokensToExp } from '../parsers/text'
+import { parseDirective } from '../parsers/directive'
+import { parseTemplate } from '../parsers/template'
+import { resolveAsset } from '../util/index'
+import {
+  toArray,
+  warn,
+  remove,
+  replace,
+  commonTagRE,
+  checkComponentAttr,
+  findRef,
+  defineReactive,
+  getAttr
+} from '../util/index'
 
-module.exports = compile
+// special binding prefixes
+const bindRE = /^v-bind:|^:/
+const onRE = /^v-on:|^@/
+const dirAttrRE = /^v-([^:]+)(?:$|:(.*)$)/
+const modifierRE = /\.[^\.]+/g
+const transitionRE = /^(v-bind:|:)?transition$/
+
+// default directive priority
+const DEFAULT_PRIORITY = 1000
+const DEFAULT_TERMINAL_PRIORITY = 2000
 
 /**
  * Compile a template and return a reusable composite link
  * function, which recursively contains more link functions
- * inside. This top level compile function should only be
- * called on instance root nodes.
+ * inside. This top level compile function would normally
+ * be called on instance root nodes, but can also be used
+ * for partial compilation if the partial argument is true.
+ *
+ * The returned composite link function, when called, will
+ * return an unlink function that tearsdown all directives
+ * created during the linking phase.
  *
  * @param {Element|DocumentFragment} el
  * @param {Object} options
  * @param {Boolean} partial
- * @param {Boolean} transcluded
  * @return {Function}
  */
 
-function compile (el, options, partial, transcluded) {
-  var isBlock = el.nodeType === 11
-  // link function for param attributes.
-  var params = options.paramAttributes
-  var paramsLinkFn = params && !partial && !transcluded && !isBlock
-    ? compileParamAttributes(el, params, options)
-    : null
+export function compile (el, options, partial) {
   // link function for the node itself.
-  // if this is a block instance, we return a link function
-  // for the attributes found on the container, if any.
-  // options._containerAttrs are collected during transclusion.
-  var nodeLinkFn = isBlock
-    ? compileBlockContainer(options._containerAttrs, params, options)
-    : compileNode(el, options)
+  var nodeLinkFn = partial || !options._asComponent
+    ? compileNode(el, options)
+    : null
   // link function for the childNodes
   var childLinkFn =
     !(nodeLinkFn && nodeLinkFn.terminal) &&
@@ -48,97 +65,211 @@ function compile (el, options, partial, transcluded) {
    *
    * @param {Vue} vm
    * @param {Element|DocumentFragment} el
+   * @param {Vue} [host] - host vm of transcluded content
+   * @param {Object} [scope] - v-for scope
+   * @param {Fragment} [frag] - link context fragment
    * @return {Function|undefined}
    */
 
-  function compositeLinkFn (vm, el) {
-    var originalDirCount = vm._directives.length
-    var parentOriginalDirCount =
-      vm.$parent && vm.$parent._directives.length
-    if (paramsLinkFn) {
-      paramsLinkFn(vm, el)
-    }
+  return function compositeLinkFn (vm, el, host, scope, frag) {
     // cache childNodes before linking parent, fix #657
-    var childNodes = _.toArray(el.childNodes)
-    // if this is a transcluded compile, linkers need to be
-    // called in source scope, and the host needs to be
-    // passed down.
-    var source = transcluded ? vm.$parent : vm
-    var host = transcluded ? vm : undefined
+    var childNodes = toArray(el.childNodes)
     // link
-    if (nodeLinkFn) nodeLinkFn(source, el, host)
-    if (childLinkFn) childLinkFn(source, childNodes, host)
-
-    /**
-     * If this is a partial compile, the linker function
-     * returns an unlink function that tearsdown all
-     * directives instances generated during the partial
-     * linking.
-     */
-
-    if (partial && !transcluded) {
-      var selfDirs = vm._directives.slice(originalDirCount)
-      var parentDirs = vm.$parent &&
-        vm.$parent._directives.slice(parentOriginalDirCount)
-
-      var teardownDirs = function (vm, dirs) {
-        var i = dirs.length
-        while (i--) {
-          dirs[i]._teardown()
-        }
-        i = vm._directives.indexOf(dirs[0])
-        vm._directives.splice(i, dirs.length)
-      }
-
-      return function unlink () {
-        teardownDirs(vm, selfDirs)
-        if (parentDirs) {
-          teardownDirs(vm.$parent, parentDirs)
-        }
-      }
-    }
+    var dirs = linkAndCapture(function compositeLinkCapturer () {
+      if (nodeLinkFn) nodeLinkFn(vm, el, host, scope, frag)
+      if (childLinkFn) childLinkFn(vm, childNodes, host, scope, frag)
+    }, vm)
+    return makeUnlinkFn(vm, dirs)
   }
-
-  // transcluded linkFns are terminal, because it takes
-  // over the entire sub-tree.
-  if (transcluded) {
-    compositeLinkFn.terminal = true
-  }
-
-  return compositeLinkFn
 }
 
 /**
- * Compile the attributes found on a "block container" -
- * i.e. the container node in the parent tempate of a block
- * instance. We are only concerned with v-with and
- * paramAttributes here.
+ * Apply a linker to a vm/element pair and capture the
+ * directives created during the process.
  *
- * @param {Object} attrs - a map of attr name/value pairs
- * @param {Array} params - param attributes list
- * @param {Object} options
+ * @param {Function} linker
+ * @param {Vue} vm
+ */
+
+function linkAndCapture (linker, vm) {
+  /* istanbul ignore if */
+  if (process.env.NODE_ENV === 'production') {
+    // reset directives before every capture in production
+    // mode, so that when unlinking we don't need to splice
+    // them out (which turns out to be a perf hit).
+    // they are kept in development mode because they are
+    // useful for Vue's own tests.
+    vm._directives = []
+  }
+  var originalDirCount = vm._directives.length
+  linker()
+  var dirs = vm._directives.slice(originalDirCount)
+  dirs.sort(directiveComparator)
+  for (var i = 0, l = dirs.length; i < l; i++) {
+    dirs[i]._bind()
+  }
+  return dirs
+}
+
+/**
+ * Directive priority sort comparator
+ *
+ * @param {Object} a
+ * @param {Object} b
+ */
+
+function directiveComparator (a, b) {
+  a = a.descriptor.def.priority || DEFAULT_PRIORITY
+  b = b.descriptor.def.priority || DEFAULT_PRIORITY
+  return a > b ? -1 : a === b ? 0 : 1
+}
+
+/**
+ * Linker functions return an unlink function that
+ * tearsdown all directives instances generated during
+ * the process.
+ *
+ * We create unlink functions with only the necessary
+ * information to avoid retaining additional closures.
+ *
+ * @param {Vue} vm
+ * @param {Array} dirs
+ * @param {Vue} [context]
+ * @param {Array} [contextDirs]
  * @return {Function}
  */
 
-function compileBlockContainer (attrs, params, options) {
-  if (!attrs) return null
-  var paramsLinkFn = params
-    ? compileParamAttributes(attrs, params, options)
-    : null
-  var withVal = attrs[config.prefix + 'with']
-  var withLinkFn = null
-  if (withVal) {
-    var descriptor = dirParser.parse(withVal)[0]
-    var def = options.directives['with']
-    withLinkFn = function (vm, el) {
-      vm._bindDir('with', el, descriptor, def)   
+function makeUnlinkFn (vm, dirs, context, contextDirs) {
+  function unlink (destroying) {
+    teardownDirs(vm, dirs, destroying)
+    if (context && contextDirs) {
+      teardownDirs(context, contextDirs)
     }
   }
-  return function blockContainerLinkFn (vm) {
-    // explicitly passing null to the linkers
-    // since v-with doesn't need a real element
-    if (paramsLinkFn) paramsLinkFn(vm, null)
-    if (withLinkFn) withLinkFn(vm, null)
+  // expose linked directives
+  unlink.dirs = dirs
+  return unlink
+}
+
+/**
+ * Teardown partial linked directives.
+ *
+ * @param {Vue} vm
+ * @param {Array} dirs
+ * @param {Boolean} destroying
+ */
+
+function teardownDirs (vm, dirs, destroying) {
+  var i = dirs.length
+  while (i--) {
+    dirs[i]._teardown()
+    if (process.env.NODE_ENV !== 'production' && !destroying) {
+      vm._directives.$remove(dirs[i])
+    }
+  }
+}
+
+/**
+ * Compile link props on an instance.
+ *
+ * @param {Vue} vm
+ * @param {Element} el
+ * @param {Object} props
+ * @param {Object} [scope]
+ * @return {Function}
+ */
+
+export function compileAndLinkProps (vm, el, props, scope) {
+  var propsLinkFn = compileProps(el, props, vm)
+  var propDirs = linkAndCapture(function () {
+    propsLinkFn(vm, scope)
+  }, vm)
+  return makeUnlinkFn(vm, propDirs)
+}
+
+/**
+ * Compile the root element of an instance.
+ *
+ * 1. attrs on context container (context scope)
+ * 2. attrs on the component template root node, if
+ *    replace:true (child scope)
+ *
+ * If this is a fragment instance, we only need to compile 1.
+ *
+ * @param {Element} el
+ * @param {Object} options
+ * @param {Object} contextOptions
+ * @return {Function}
+ */
+
+export function compileRoot (el, options, contextOptions) {
+  var containerAttrs = options._containerAttrs
+  var replacerAttrs = options._replacerAttrs
+  var contextLinkFn, replacerLinkFn
+
+  // only need to compile other attributes for
+  // non-fragment instances
+  if (el.nodeType !== 11) {
+    // for components, container and replacer need to be
+    // compiled separately and linked in different scopes.
+    if (options._asComponent) {
+      // 2. container attributes
+      if (containerAttrs && contextOptions) {
+        contextLinkFn = compileDirectives(containerAttrs, contextOptions)
+      }
+      if (replacerAttrs) {
+        // 3. replacer attributes
+        replacerLinkFn = compileDirectives(replacerAttrs, options)
+      }
+    } else {
+      // non-component, just compile as a normal element.
+      replacerLinkFn = compileDirectives(el.attributes, options)
+    }
+  } else if (process.env.NODE_ENV !== 'production' && containerAttrs) {
+    // warn container directives for fragment instances
+    var names = containerAttrs
+      .filter(function (attr) {
+        // allow vue-loader/vueify scoped css attributes
+        return attr.name.indexOf('_v-') < 0 &&
+          // allow event listeners
+          !onRE.test(attr.name) &&
+          // allow slots
+          attr.name !== 'slot'
+      })
+      .map(function (attr) {
+        return '"' + attr.name + '"'
+      })
+    if (names.length) {
+      var plural = names.length > 1
+      warn(
+        'Attribute' + (plural ? 's ' : ' ') + names.join(', ') +
+        (plural ? ' are' : ' is') + ' ignored on component ' +
+        '<' + options.el.tagName.toLowerCase() + '> because ' +
+        'the component is a fragment instance: ' +
+        'http://vuejs.org/guide/components.html#Fragment_Instance'
+      )
+    }
+  }
+
+  options._containerAttrs = options._replacerAttrs = null
+  return function rootLinkFn (vm, el, scope) {
+    // link context scope dirs
+    var context = vm._context
+    var contextDirs
+    if (context && contextLinkFn) {
+      contextDirs = linkAndCapture(function () {
+        contextLinkFn(context, el, null, scope)
+      }, context)
+    }
+
+    // link self
+    var selfDirs = linkAndCapture(function () {
+      if (replacerLinkFn) replacerLinkFn(vm, el)
+    }, vm)
+
+    // return the unlink function that tearsdown context
+    // container directives.
+    return makeUnlinkFn(vm, selfDirs, context, contextDirs)
   }
 }
 
@@ -155,7 +286,7 @@ function compileNode (node, options) {
   var type = node.nodeType
   if (type === 1 && node.tagName !== 'SCRIPT') {
     return compileElement(node, options)
-  } else if (type === 3 && config.interpolate && node.data.trim()) {
+  } else if (type === 3 && node.data.trim()) {
     return compileTextNode(node, options)
   } else {
     return null
@@ -171,79 +302,36 @@ function compileNode (node, options) {
  */
 
 function compileElement (el, options) {
-  if (checkTransclusion(el)) {
-    // unwrap textNode
-    if (el.hasAttribute('__vue__wrap')) {
-      el = el.firstChild
-    }
-    return compile(el, options._parent.$options, true, true)
-  }
-  var linkFn, tag, component
-  // check custom element component, but only on non-root
-  if (!el.__vue__) {
-    tag = el.tagName.toLowerCase()
-    component =
-      tag.indexOf('-') > 0 &&
-      options.components[tag]
-    if (component) {
-      el.setAttribute(config.prefix + 'component', tag)
-    }
-  }
-  if (component || el.hasAttributes()) {
-    // check terminal direcitves
-    linkFn = checkTerminalDirectives(el, options)
-    // if not terminal, build normal link function
-    if (!linkFn) {
-      var dirs = collectDirectives(el, options)
-      linkFn = dirs.length
-        ? makeNodeLinkFn(dirs)
-        : null
-    }
-  }
-  // if the element is a textarea, we need to interpolate
-  // its content on initial render.
+  // preprocess textareas.
+  // textarea treats its text content as the initial value.
+  // just bind it as an attr directive for value.
   if (el.tagName === 'TEXTAREA') {
-    var realLinkFn = linkFn
-    linkFn = function (vm, el) {
-      el.value = vm.$interpolate(el.value)
-      if (realLinkFn) realLinkFn(vm, el)
+    var tokens = parseText(el.value)
+    if (tokens) {
+      el.setAttribute(':value', tokensToExp(tokens))
+      el.value = ''
     }
-    linkFn.terminal = true
+  }
+  var linkFn
+  var hasAttrs = el.hasAttributes()
+  var attrs = hasAttrs && toArray(el.attributes)
+  // check terminal directives (for & if)
+  if (hasAttrs) {
+    linkFn = checkTerminalDirectives(el, attrs, options)
+  }
+  // check element directives
+  if (!linkFn) {
+    linkFn = checkElementDirectives(el, options)
+  }
+  // check component
+  if (!linkFn) {
+    linkFn = checkComponent(el, options)
+  }
+  // normal directives
+  if (!linkFn && hasAttrs) {
+    linkFn = compileDirectives(attrs, options)
   }
   return linkFn
-}
-
-/**
- * Build a link function for all directives on a single node.
- *
- * @param {Array} directives
- * @return {Function} directivesLinkFn
- */
-
-function makeNodeLinkFn (directives) {
-  return function nodeLinkFn (vm, el, host) {
-    // reverse apply because it's sorted low to high
-    var i = directives.length
-    var dir, j, k, target
-    while (i--) {
-      dir = directives[i]
-      // a directive can be transcluded if it's written
-      // on a component's container in its parent tempalte.
-      target = dir.transcluded
-        ? vm.$parent
-        : vm
-      if (dir._link) {
-        // custom link fn
-        dir._link(target, el)
-      } else {
-        k = dir.descriptors.length
-        for (j = 0; j < k; j++) {
-          target._bindDir(dir.name, el,
-            dir.descriptors[j], dir.def, host)
-        }
-      }
-    }
-  }
 }
 
 /**
@@ -255,10 +343,27 @@ function makeNodeLinkFn (directives) {
  */
 
 function compileTextNode (node, options) {
-  var tokens = textParser.parse(node.data)
+  // skip marked text nodes
+  if (node._skip) {
+    return removeText
+  }
+
+  var tokens = parseText(node.wholeText)
   if (!tokens) {
     return null
   }
+
+  // mark adjacent text nodes as skipped,
+  // because we are using node.wholeText to compile
+  // all adjacent text nodes together. This fixes
+  // issues in IE where sometimes it splits up a single
+  // text node into multiple ones.
+  var next = node.nextSibling
+  while (next && next.nodeType === 3) {
+    next._skip = true
+    next = next.nextSibling
+  }
+
   var frag = document.createDocumentFragment()
   var el, token
   for (var i = 0, l = tokens.length; i < l; i++) {
@@ -269,6 +374,17 @@ function compileTextNode (node, options) {
     frag.appendChild(el)
   }
   return makeTextNodeLinkFn(tokens, frag, options)
+}
+
+/**
+ * Linker for an skipped text node.
+ *
+ * @param {Vue} vm
+ * @param {Text} node
+ */
+
+function removeText (vm, node) {
+  remove(node)
 }
 
 /**
@@ -287,9 +403,6 @@ function processTextToken (token, options) {
     if (token.html) {
       el = document.createComment('v-html')
       setTokenType('html')
-    } else if (token.partial) {
-      el = document.createComment('v-partial')
-      setTokenType('partial')
     } else {
       // IE will clean up empty textNodes during
       // frag.cloneNode(true), so we have to give it
@@ -299,9 +412,14 @@ function processTextToken (token, options) {
     }
   }
   function setTokenType (type) {
-    token.type = type
-    token.def = options.directives[type]
-    token.descriptor = dirParser.parse(token.value)[0]
+    if (token.descriptor) return
+    var parsed = parseDirective(token.value)
+    token.descriptor = {
+      name: type,
+      def: publicDirectives[type],
+      expression: parsed.expression,
+      filters: parsed.filters
+    }
   }
   return el
 }
@@ -314,9 +432,9 @@ function processTextToken (token, options) {
  */
 
 function makeTextNodeLinkFn (tokens, frag) {
-  return function textNodeLinkFn (vm, el) {
+  return function textNodeLinkFn (vm, el, host, scope) {
     var fragClone = frag.cloneNode(true)
-    var childNodes = _.toArray(fragClone.childNodes)
+    var childNodes = toArray(fragClone.childNodes)
     var token, value, node
     for (var i = 0, l = tokens.length; i < l; i++) {
       token = tokens[i]
@@ -324,19 +442,18 @@ function makeTextNodeLinkFn (tokens, frag) {
       if (token.tag) {
         node = childNodes[i]
         if (token.oneTime) {
-          value = vm.$eval(value)
+          value = (scope || vm).$eval(value)
           if (token.html) {
-            _.replace(node, templateParser.parse(value, true))
+            replace(node, parseTemplate(value, true))
           } else {
             node.data = value
           }
         } else {
-          vm._bindDir(token.type, node,
-                      token.descriptor, token.def)
+          vm._bindDir(token.descriptor, node, host, scope)
         }
       }
     }
-    _.replace(el, fragClone)
+    replace(el, fragClone)
   }
 }
 
@@ -375,113 +492,73 @@ function compileNodeList (nodeList, options) {
  */
 
 function makeChildLinkFn (linkFns) {
-  return function childLinkFn (vm, nodes, host) {
+  return function childLinkFn (vm, nodes, host, scope, frag) {
     var node, nodeLinkFn, childrenLinkFn
     for (var i = 0, n = 0, l = linkFns.length; i < l; n++) {
       node = nodes[n]
       nodeLinkFn = linkFns[i++]
       childrenLinkFn = linkFns[i++]
       // cache childNodes before linking parent, fix #657
-      var childNodes = _.toArray(node.childNodes)
+      var childNodes = toArray(node.childNodes)
       if (nodeLinkFn) {
-        nodeLinkFn(vm, node, host)
+        nodeLinkFn(vm, node, host, scope, frag)
       }
       if (childrenLinkFn) {
-        childrenLinkFn(vm, childNodes, host)
+        childrenLinkFn(vm, childNodes, host, scope, frag)
       }
     }
   }
 }
 
 /**
- * Compile param attributes on a root element and return
- * a paramAttributes link function.
+ * Check for element directives (custom elements that should
+ * be resovled as terminal directives).
  *
- * @param {Element|Object} el
- * @param {Array} attrs
+ * @param {Element} el
  * @param {Object} options
- * @return {Function} paramsLinkFn
  */
 
-function compileParamAttributes (el, attrs, options) {
-  var params = []
-  var isEl = el.nodeType
-  var i = attrs.length
-  var name, value, param
-  while (i--) {
-    name = attrs[i]
-    if (/[A-Z]/.test(name)) {
-      _.warn(
-        'You seem to be using camelCase for a paramAttribute, ' +
-        'but HTML doesn\'t differentiate between upper and ' +
-        'lower case. You should use hyphen-delimited ' +
-        'attribute names. For more info see ' +
-        'http://vuejs.org/api/options.html#paramAttributes'
-      )
-    }
-    value = isEl ? el.getAttribute(name) : el[name]
-    if (value !== null) {
-      param = {
-        name: name,
-        value: value
-      }
-      var tokens = textParser.parse(value)
-      if (tokens) {
-        if (isEl) el.removeAttribute(name)
-        if (tokens.length > 1) {
-          _.warn(
-            'Invalid param attribute binding: "' +
-            name + '="' + value + '"' +
-            '\nDon\'t mix binding tags with plain text ' +
-            'in param attribute bindings.'
-          )
-          continue
-        } else {
-          param.dynamic = true
-          param.value = tokens[0].value
-        }
-      }
-      params.push(param)
-    }
+function checkElementDirectives (el, options) {
+  var tag = el.tagName.toLowerCase()
+  if (commonTagRE.test(tag)) {
+    return
   }
-  return makeParamsLinkFn(params, options)
+  var def = resolveAsset(options, 'elementDirectives', tag)
+  if (def) {
+    return makeTerminalNodeLinkFn(el, tag, '', options, def)
+  }
 }
 
 /**
- * Build a function that applies param attributes to a vm.
+ * Check if an element is a component. If yes, return
+ * a component link function.
  *
- * @param {Array} params
+ * @param {Element} el
  * @param {Object} options
- * @return {Function} paramsLinkFn
+ * @return {Function|undefined}
  */
 
-var dataAttrRE = /^data-/
-
-function makeParamsLinkFn (params, options) {
-  var def = options.directives['with']
-  return function paramsLinkFn (vm, el) {
-    var i = params.length
-    var param, path
-    while (i--) {
-      param = params[i]
-      // params could contain dashes, which will be
-      // interpreted as minus calculations by the parser
-      // so we need to wrap the path here
-      path = _.camelize(param.name.replace(dataAttrRE, ''))
-      if (param.dynamic) {
-        // dynamic param attribtues are bound as v-with.
-        // we can directly duck the descriptor here beacuse
-        // param attributes cannot use expressions or
-        // filters.
-        vm._bindDir('with', el, {
-          arg: path,
-          expression: param.value
-        }, def)
-      } else {
-        // just set once
-        vm.$set(path, param.value)
+function checkComponent (el, options) {
+  var component = checkComponentAttr(el, options)
+  if (component) {
+    var ref = findRef(el)
+    var descriptor = {
+      name: 'component',
+      ref: ref,
+      expression: component.id,
+      def: internalDirectives.component,
+      modifiers: {
+        literal: !component.dynamic
       }
     }
+    var componentLinkFn = function (vm, el, host, scope, frag) {
+      if (ref) {
+        defineReactive((scope || vm).$refs, ref, null)
+      }
+      vm._bindDir(descriptor, el, host, scope, frag)
+    }
+    componentLinkFn.terminal = true
+    return componentLinkFn
   }
 }
 
@@ -490,32 +567,50 @@ function makeParamsLinkFn (params, options) {
  * If it finds one, return a terminal link function.
  *
  * @param {Element} el
+ * @param {Array} attrs
  * @param {Object} options
  * @return {Function} terminalLinkFn
  */
 
-var terminalDirectives = [
-  'repeat',
-  'if',
-  'component'
-]
+function checkTerminalDirectives (el, attrs, options) {
+  // skip v-pre
+  if (getAttr(el, 'v-pre') !== null) {
+    return skip
+  }
+  // skip v-else block, but only if following v-if
+  if (el.hasAttribute('v-else')) {
+    var prev = el.previousElementSibling
+    if (prev && prev.hasAttribute('v-if')) {
+      return skip
+    }
+  }
+
+  var attr, name, value, modifiers, matched, dirName, rawName, arg, def, termDef
+  for (var i = 0, j = attrs.length; i < j; i++) {
+    attr = attrs[i]
+    modifiers = parseModifiers(attr.name)
+    name = attr.name.replace(modifierRE, '')
+    if ((matched = name.match(dirAttrRE))) {
+      def = resolveAsset(options, 'directives', matched[1])
+      if (def && def.terminal) {
+        if (!termDef || ((def.priority || DEFAULT_TERMINAL_PRIORITY) > termDef.priority)) {
+          termDef = def
+          rawName = attr.name
+          value = attr.value
+          dirName = matched[1]
+          arg = matched[2]
+        }
+      }
+    }
+  }
+
+  if (termDef) {
+    return makeTerminalNodeLinkFn(el, dirName, value, options, termDef, rawName, arg, modifiers)
+  }
+}
 
 function skip () {}
 skip.terminal = true
-
-function checkTerminalDirectives (el, options) {
-  if (_.attr(el, 'pre') !== null) {
-    return skip
-  }
-  var value, dirName
-  /* jshint boss: true */
-  for (var i = 0; i < 3; i++) {
-    dirName = terminalDirectives[i]
-    if (value = _.attr(el, dirName)) {
-      return makeTerminalNodeLinkFn(el, dirName, value, options)
-    }
-  }
-}
 
 /**
  * Build a node link function for a terminal directive.
@@ -527,126 +622,200 @@ function checkTerminalDirectives (el, options) {
  * @param {String} dirName
  * @param {String} value
  * @param {Object} options
+ * @param {Object} def
+ * @param {String} [rawName]
+ * @param {String} [arg]
+ * @param {Object} [modifiers]
  * @return {Function} terminalLinkFn
  */
 
-function makeTerminalNodeLinkFn (el, dirName, value, options) {
-  var descriptor = dirParser.parse(value)[0]
-  var def = options.directives[dirName]
-  var fn = function terminalNodeLinkFn (vm, el, host) {
-    vm._bindDir(dirName, el, descriptor, def, host)
+function makeTerminalNodeLinkFn (el, dirName, value, options, def, rawName, arg, modifiers) {
+  var parsed = parseDirective(value)
+  var descriptor = {
+    name: dirName,
+    arg: arg,
+    expression: parsed.expression,
+    filters: parsed.filters,
+    raw: value,
+    attr: rawName,
+    modifiers: modifiers,
+    def: def
+  }
+  // check ref for v-for and router-view
+  if (dirName === 'for' || dirName === 'router-view') {
+    descriptor.ref = findRef(el)
+  }
+  var fn = function terminalNodeLinkFn (vm, el, host, scope, frag) {
+    if (descriptor.ref) {
+      defineReactive((scope || vm).$refs, descriptor.ref, null)
+    }
+    vm._bindDir(descriptor, el, host, scope, frag)
   }
   fn.terminal = true
   return fn
 }
 
 /**
- * Collect the directives on an element.
+ * Compile the directives on an element and return a linker.
  *
- * @param {Element} el
+ * @param {Array|NamedNodeMap} attrs
  * @param {Object} options
- * @return {Array}
+ * @return {Function}
  */
 
-function collectDirectives (el, options) {
-  var attrs = _.toArray(el.attributes)
+function compileDirectives (attrs, options) {
   var i = attrs.length
   var dirs = []
-  var attr, attrName, dir, dirName, dirDef, transcluded
+  var attr, name, value, rawName, rawValue, dirName, arg, modifiers, dirDef, tokens, matched
   while (i--) {
     attr = attrs[i]
-    attrName = attr.name
-    transcluded =
-      options._transcludedAttrs &&
-      options._transcludedAttrs[attrName]
-    if (attrName.indexOf(config.prefix) === 0) {
-      dirName = attrName.slice(config.prefix.length)
-      dirDef = options.directives[dirName]
-      _.assertAsset(dirDef, 'directive', dirName)
-      if (dirDef) {
-        dirs.push({
-          name: dirName,
-          descriptors: dirParser.parse(attr.value),
-          def: dirDef,
-          transcluded: transcluded
-        })
+    name = rawName = attr.name
+    value = rawValue = attr.value
+    tokens = parseText(value)
+    // reset arg
+    arg = null
+    // check modifiers
+    modifiers = parseModifiers(name)
+    name = name.replace(modifierRE, '')
+
+    // attribute interpolations
+    if (tokens) {
+      value = tokensToExp(tokens)
+      arg = name
+      pushDir('bind', publicDirectives.bind, tokens)
+      // warn against mixing mustaches with v-bind
+      if (process.env.NODE_ENV !== 'production') {
+        if (name === 'class' && Array.prototype.some.call(attrs, function (attr) {
+          return attr.name === ':class' || attr.name === 'v-bind:class'
+        })) {
+          warn(
+            'class="' + rawValue + '": Do not mix mustache interpolation ' +
+            'and v-bind for "class" on the same element. Use one or the other.',
+            options
+          )
+        }
       }
-    } else if (config.interpolate) {
-      dir = collectAttrDirective(el, attrName, attr.value,
-                                 options)
-      if (dir) {
-        dir.transcluded = transcluded
-        dirs.push(dir)
+    } else
+
+    // special attribute: transition
+    if (transitionRE.test(name)) {
+      modifiers.literal = !bindRE.test(name)
+      pushDir('transition', internalDirectives.transition)
+    } else
+
+    // event handlers
+    if (onRE.test(name)) {
+      arg = name.replace(onRE, '')
+      pushDir('on', publicDirectives.on)
+    } else
+
+    // attribute bindings
+    if (bindRE.test(name)) {
+      dirName = name.replace(bindRE, '')
+      if (dirName === 'style' || dirName === 'class') {
+        pushDir(dirName, internalDirectives[dirName])
+      } else {
+        arg = dirName
+        pushDir('bind', publicDirectives.bind)
+      }
+    } else
+
+    // normal directives
+    if ((matched = name.match(dirAttrRE))) {
+      dirName = matched[1]
+      arg = matched[2]
+
+      // skip v-else (when used with v-show)
+      if (dirName === 'else') {
+        continue
+      }
+
+      dirDef = resolveAsset(options, 'directives', dirName, true)
+      if (dirDef) {
+        pushDir(dirName, dirDef)
       }
     }
   }
-  // sort by priority, LOW to HIGH
-  dirs.sort(directiveComparator)
-  return dirs
+
+  /**
+   * Push a directive.
+   *
+   * @param {String} dirName
+   * @param {Object|Function} def
+   * @param {Array} [interpTokens]
+   */
+
+  function pushDir (dirName, def, interpTokens) {
+    var hasOneTimeToken = interpTokens && hasOneTime(interpTokens)
+    var parsed = !hasOneTimeToken && parseDirective(value)
+    dirs.push({
+      name: dirName,
+      attr: rawName,
+      raw: rawValue,
+      def: def,
+      arg: arg,
+      modifiers: modifiers,
+      // conversion from interpolation strings with one-time token
+      // to expression is differed until directive bind time so that we
+      // have access to the actual vm context for one-time bindings.
+      expression: parsed && parsed.expression,
+      filters: parsed && parsed.filters,
+      interp: interpTokens,
+      hasOneTime: hasOneTimeToken
+    })
+  }
+
+  if (dirs.length) {
+    return makeNodeLinkFn(dirs)
+  }
 }
 
 /**
- * Check an attribute for potential dynamic bindings,
- * and return a directive object.
+ * Parse modifiers from directive attribute name.
  *
- * @param {Element} el
  * @param {String} name
- * @param {String} value
- * @param {Object} options
  * @return {Object}
  */
 
-function collectAttrDirective (el, name, value, options) {
-  var tokens = textParser.parse(value)
-  if (tokens) {
-    var def = options.directives.attr
-    var i = tokens.length
-    var allOneTime = true
+function parseModifiers (name) {
+  var res = Object.create(null)
+  var match = name.match(modifierRE)
+  if (match) {
+    var i = match.length
     while (i--) {
-      var token = tokens[i]
-      if (token.tag && !token.oneTime) {
-        allOneTime = false
-      }
+      res[match[i].slice(1)] = true
     }
-    return {
-      def: def,
-      _link: allOneTime
-        ? function (vm, el) {
-            el.setAttribute(name, vm.$interpolate(value))
-          }
-        : function (vm, el) {
-            var value = textParser.tokensToExp(tokens, vm)
-            var desc = dirParser.parse(name + ':' + value)[0]
-            vm._bindDir('attr', el, desc, def)
-          }
+  }
+  return res
+}
+
+/**
+ * Build a link function for all directives on a single node.
+ *
+ * @param {Array} directives
+ * @return {Function} directivesLinkFn
+ */
+
+function makeNodeLinkFn (directives) {
+  return function nodeLinkFn (vm, el, host, scope, frag) {
+    // reverse apply because it's sorted low to high
+    var i = directives.length
+    while (i--) {
+      vm._bindDir(directives[i], el, host, scope, frag)
     }
   }
 }
 
 /**
- * Directive priority sort comparator
+ * Check if an interpolation string contains one-time tokens.
  *
- * @param {Object} a
- * @param {Object} b
- */
-
-function directiveComparator (a, b) {
-  a = a.def.priority || 0
-  b = b.def.priority || 0
-  return a > b ? 1 : -1
-}
-
-/**
- * Check whether an element is transcluded
- *
- * @param {Element} el
+ * @param {Array} tokens
  * @return {Boolean}
  */
 
-var transcludedFlagAttr = '__vue__transcluded'
-function checkTransclusion (el) {
-  if (el.nodeType === 1 && el.hasAttribute(transcludedFlagAttr)) {
-    el.removeAttribute(transcludedFlagAttr)
-    return true
+function hasOneTime (tokens) {
+  var i = tokens.length
+  while (i--) {
+    if (tokens[i].oneTime) return true
   }
 }

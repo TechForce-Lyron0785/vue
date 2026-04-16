@@ -1,12 +1,11 @@
-var expParser = require('../../../../src/parsers/expression')
-var _ = require('../../../../src/util')
+var expParser = require('src/parsers/expression')
 
 var testCases = [
   {
     // simple path
     exp: 'a.b.d',
     scope: {
-      a:{b:{d:123}}
+      a: { b: { d: 123 }}
     },
     expected: 123,
     paths: ['a']
@@ -15,7 +14,7 @@ var testCases = [
   {
     exp: 'a["b"].c',
     scope: {
-      a:{b:{c:234}}
+      a: { b: { c: 234 }}
     },
     expected: 234,
     paths: ['a']
@@ -63,10 +62,10 @@ var testCases = [
     paths: ['a']
   },
   {
-    //multiline expressions
+    // multiline expressions
     exp: "{\n a: '35',\n b: c}",
-    scope:{c:32},
-    expected: { a : '35', b : 32 }
+    scope: {c: 32},
+    expected: { a: '35', b: 32 }
   },
   {
     // dollar signs and underscore
@@ -109,15 +108,15 @@ var testCases = [
   },
   {
     // expressions with inline object literals
-    exp: "sortRows({ column: 'name', test: haha, durrr: 123 })",
+    exp: "sortRows({ column: 'name', test: foo, durrr: 123 })",
     scope: {
       sortRows: function (params) {
         return params.column + params.test + params.durrr
       },
-      haha: 'hoho'
+      foo: 'bar'
     },
-    expected: 'namehoho123',
-    paths: ['sortRows', 'haha']
+    expected: 'namebar123',
+    paths: ['sortRows', 'bar']
   },
   {
     // space between path segments
@@ -149,7 +148,7 @@ var testCases = [
     paths: ['a']
   },
   {
-    //keyowrd + keyword literal
+    // keyowrd + keyword literal
     exp: 'true && a.true',
     scope: {
       a: { 'true': false }
@@ -172,6 +171,27 @@ var testCases = [
     },
     expected: 8,
     paths: ['$a', 'b', 'c', 'e']
+  },
+  {
+    // string with escaped quotes
+    exp: "'a\\'b' + c",
+    scope: {
+      c: '\'c'
+    },
+    expected: "a\'b\'c",
+    paths: ['c']
+  },
+  {
+    // dynamic sub path
+    exp: "a['b' + i + 'c']",
+    scope: {
+      i: 0,
+      a: {
+        'b0c': 123
+      }
+    },
+    expected: 123,
+    paths: ['a', 'i']
   },
   {
     // Math global, simple path
@@ -208,7 +228,7 @@ var testCases = [
   // typeof operator
   {
     exp: 'typeof test === "string"',
-    scope: { test: "123" },
+    scope: { test: '123' },
     expected: true,
     paths: ['test']
   },
@@ -229,10 +249,9 @@ var testCases = [
 ]
 
 describe('Expression Parser', function () {
-
   testCases.forEach(function (testCase) {
     it('parse getter: ' + testCase.exp, function () {
-      var res = expParser.parse(testCase.exp, true)
+      var res = expParser.parseExpression(testCase.exp, true)
       expect(res.get(testCase.scope)).toEqual(testCase.expected)
     })
   })
@@ -240,8 +259,8 @@ describe('Expression Parser', function () {
   it('dynamic setter', function () {
     // make sure checkSetter works:
     // should add setter if a cache hit doesn't have hit function.
-    expParser.parse('a[b]')
-    var res = expParser.parse('a[b]', true)
+    expParser.parseExpression('a[b]')
+    var res = expParser.parseExpression('a[b]', true)
     var scope = {
       a: { c: 1 },
       b: 'c'
@@ -251,59 +270,60 @@ describe('Expression Parser', function () {
   })
 
   it('simple path setter', function () {
-    var res = expParser.parse('a.b.c', true)
+    var res = expParser.parseExpression('a.b.c', true)
     var scope = {}
     expect(function () {
       res.set(scope, 123)
     }).not.toThrow()
-    scope.a = {b:{c:0}}
+    scope.a = {b: {c: 0}}
     res.set(scope, 123)
     expect(scope.a.b.c).toBe(123)
   })
 
   it('cache', function () {
-    var res1 = expParser.parse('a + b')
-    var res2 = expParser.parse('a + b')
+    var res1 = expParser.parseExpression('a + b')
+    var res2 = expParser.parseExpression('a + b')
     expect(res1).toBe(res2)
   })
 
+  if (canMakeTemplateStringFunction()) {
+    it('ES2015 template string handling', function () {
+      var res = expParser.parseExpression('a + `hi ${ b }` + c')
+      expect(res.get.toString().indexOf('scope.a+`hi ${scope.b}`+scope.c') > -1).toBe(true)
+      res = expParser.parseExpression('`hi ${ b + `${ d }` }`')
+      expect(res.get.toString().indexOf('`hi ${scope.b+`${scope.d}`}`') > -1).toBe(true)
+      res = expParser.parseExpression('{transform:`rotate(${x}deg)`}')
+      expect(res.get.toString().indexOf('{transform:`rotate(${scope.x}deg)`}') > -1).toBe(true)
+    })
+  }
+
   describe('invalid expression', function () {
-    
-    beforeEach(function () {
-      spyOn(_, 'warn')
-    })
-
     it('should warn on invalid expression', function () {
-      expect(_.warn).not.toHaveBeenCalled()
-      var res = expParser.parse('a--b"ffff')
-      expect(_.warn).toHaveBeenCalled()
+      expect(getWarnCount()).toBe(0)
+      expParser.parseExpression('a--b"ffff')
+      expect('Invalid expression').toHaveBeenWarned()
     })
 
-    if (leftHandThrows()) {
-      it('should warn on invalid left hand expression for setter', function () {
-        expect(_.warn).not.toHaveBeenCalled()
-        var res = expParser.parse('a+b', true)
-        expect(_.warn).toHaveBeenCalled()
-      })
-    }
+    it('should warn on invalid setter expression', function () {
+      expect(getWarnCount()).toBe(0)
+      expParser.parseExpression('a+b', true)
+      expect('Invalid setter expression').toHaveBeenWarned()
+    })
 
     it('should warn if expression contains improper reserved keywords', function () {
-      expect(_.warn).not.toHaveBeenCalled()
-      var res = expParser.parse('break + 1')
-      expect(_.warn).toHaveBeenCalled()
+      expect(getWarnCount()).toBe(0)
+      expParser.parseExpression('break + 1')
+      expect('Avoid using reserved keywords').toHaveBeenWarned()
     })
   })
 })
 
-/**
- * check if creating a new Function with invalid left-hand
- * assignment would throw
- */
-
-function leftHandThrows () {
+function canMakeTemplateStringFunction () {
   try {
-    var fn = new Function('a + b = 1')
+    /* eslint-disable no-new-func */
+    new Function('a', 'return `${a}`')
   } catch (e) {
-    return true
+    return false
   }
+  return true
 }
